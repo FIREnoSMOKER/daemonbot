@@ -64,7 +64,6 @@ RULES:
 5. Always ask follow-up questions before advising
 6. Always warm, patient, encouraging"""
 
-# Store conversation history per user
 user_histories = {}
 
 async def get_ai_reply(user_id: int, user_message: str) -> str:
@@ -76,10 +75,9 @@ async def get_ai_reply(user_id: int, user_message: str) -> str:
         "content": user_message
     })
 
-    # Keep last 20 messages
     history = user_histories[user_id][-20:]
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=60) as client:
         response = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -95,7 +93,16 @@ async def get_ai_reply(user_id: int, user_message: str) -> str:
             }
         )
         data = response.json()
-        reply = data["content"][0]["text"]
+        print(f"Anthropic response: {data}")
+
+        if "content" in data and len(data["content"]) > 0:
+            reply = data["content"][0]["text"]
+        elif "error" in data:
+            print(f"Anthropic error: {data['error']}")
+            reply = "Sorry, I'm having a bit of trouble right now. Please try again in a moment!"
+        else:
+            print(f"Unexpected response format: {data}")
+            reply = "Sorry, I'm having a bit of trouble right now. Please try again in a moment!"
 
     user_histories[user_id].append({
         "role": "assistant",
@@ -131,7 +138,7 @@ async def process_updates(offset: int = 0) -> int:
                 reply = await get_ai_reply(user_id, text)
                 await send_message(chat_id, reply)
             except Exception as e:
-                print(f"Error: {e}")
+                print(f"Error handling message: {e}")
 
     return offset
 
