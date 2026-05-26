@@ -8,10 +8,10 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 DAEMON_USER_ID = 786893182
 
 ALERT_KEYWORDS = [
-    "interested", "personal training", "1 to 1", "1-to-1",
-    "how much", "price", "pricing", "sign up", "signup",
-    "buy", "purchase", "cost", "fee", "payment",
-    "enroll", "join", "register", "call", "calls",
+    "personal training", "1 to 1", "1-to-1",
+    "how much", "price", "pricing",
+    "buy", "purchase", "cost", "payment",
+    "register", "call", "calls", "fee",
 ]
 
 SYSTEM_PROMPT = (
@@ -162,8 +162,19 @@ user_histories = {}
 paused_users = set()
 
 def check_for_keywords(message, user_name, user_id):
+    import re
     message_lower = message.lower()
-    triggered = [kw for kw in ALERT_KEYWORDS if kw.lower() in message_lower]
+    triggered = []
+    for kw in ALERT_KEYWORDS:
+        if " " in kw:
+            # Multi-word keyword: check as phrase
+            if kw.lower() in message_lower:
+                triggered.append(kw)
+        else:
+            # Single word keyword: match whole word only
+            pattern = r'\b' + re.escape(kw.lower()) + r'\b'
+            if re.search(pattern, message_lower):
+                triggered.append(kw)
     if triggered:
         keywords_found = ", ".join(f'"{k}"' for k in triggered)
         alert = (
@@ -215,37 +226,101 @@ async def get_ai_reply(user_id, user_message):
     user_histories[user_id].append({"role": "assistant", "content": reply})
     return reply
 
+user_display_names = {}  # Store display names for each user ID
+
 async def handle_daemon_commands(text, chat_id):
+    text = text.strip()
+
+    if text == "/help":
+        await send_message(chat_id,
+            "DAEMON BOT COMMANDS\n\n"
+            "/active — see all active conversations\n"
+            "/log [ID] — see full chat log with a user\n"
+            "/takeover [ID] — pause bot, you take over\n"
+            "/resume [ID] — hand conversation back to bot\n"
+            "/paused — see who is currently paused\n\n"
+            "Example: /log 987654321"
+        )
+        return True
+
+    if text == "/active":
+        if user_histories:
+            lines = []
+            for uid, history in user_histories.items():
+                name = user_display_names.get(uid, f"ID: {uid}")
+                msg_count = len(history)
+                status = "PAUSED" if uid in paused_users else "active"
+                last_msg = history[-1]["content"][:40] + "..." if history else ""
+                lines.append(f"{name}\nID: {uid} | {msg_count} messages | {status}\nLast: \"{last_msg}\"\n")
+            await send_message(chat_id, "ACTIVE CONVERSATIONS\n\n" + "\n".join(lines))
+        else:
+            await send_message(chat_id, "No active conversations yet.")
+        return True
+
+    if text.startswith("/log"):
+        parts = text.split()
+        if len(parts) == 2 and parts[1].isdigit():
+            target_id = int(parts[1])
+            if target_id in user_histories and user_histories[target_id]:
+                name = user_display_names.get(target_id, f"User {target_id}")
+                history = user_histories[target_id]
+                lines = [f"CHAT LOG — {name}\n"]
+                for entry in history:
+                    role = "Bot" if entry["role"] == "assistant" else name.split(" ")[0]
+                    content = entry["content"]
+                    lines.append(f"{role}: {content}\n")
+                full_log = "\n".join(lines)
+                # Split into chunks if too long
+                if len(full_log) > 4000:
+                    chunks = [full_log[i:i+4000] for i in range(0, len(full_log), 4000)]
+                    for chunk in chunks:
+                        await send_message(chat_id, chunk)
+                else:
+                    await send_message(chat_id, full_log)
+            else:
+                await send_message(chat_id, f"No chat history found for ID {target_id}.")
+        else:
+            await send_message(chat_id, "Usage: /log [Telegram ID]\nExample: /log 987654321")
+        return True
+
     if text.startswith("/takeover"):
-        parts = text.strip().split()
+        parts = text.split()
         if len(parts) == 2 and parts[1].isdigit():
             target_id = int(parts[1])
             paused_users.add(target_id)
+            name = user_display_names.get(target_id, f"User {target_id}")
             await send_message(chat_id,
-                f"Takeover activated for user {target_id}.\n"
-                f"Bot will no longer auto-reply to them.\n"
+                f"Takeover activated for {name}.\n"
+                f"Bot is now silent for them.\n"
                 f"Message them directly from your personal Telegram.\n"
-                f"Send /resume {target_id} when done."
+                f"Send /resume {target_id} when you are done."
             )
         else:
             await send_message(chat_id, "Usage: /takeover [Telegram ID]\nExample: /takeover 987654321")
         return True
+
     if text.startswith("/resume"):
-        parts = text.strip().split()
+        parts = text.split()
         if len(parts) == 2 and parts[1].isdigit():
             target_id = int(parts[1])
             paused_users.discard(target_id)
-            await send_message(chat_id, f"Bot resumed for user {target_id}. Auto-reply is active again.")
+            name = user_display_names.get(target_id, f"User {target_id}")
+            await send_message(chat_id, f"Bot resumed for {name}. Auto-reply is active again.")
         else:
             await send_message(chat_id, "Usage: /resume [Telegram ID]\nExample: /resume 987654321")
         return True
-    if text.strip() == "/paused":
+
+    if text == "/paused":
         if paused_users:
-            ids = "\n".join(str(uid) for uid in paused_users)
-            await send_message(chat_id, f"Users in takeover mode:\n{ids}")
+            lines = []
+            for uid in paused_users:
+                name = user_display_names.get(uid, f"ID: {uid}")
+                lines.append(f"{name} — ID: {uid}")
+            await send_message(chat_id, "PAUSED CONVERSATIONS\n\n" + "\n".join(lines))
         else:
-            await send_message(chat_id, "No users currently in takeover mode.")
+            await send_message(chat_id, "No conversations currently paused.")
         return True
+
     return False
 
 async def process_updates(offset=0):
@@ -281,22 +356,19 @@ async def process_updates(offset=0):
                 )
 
         if text and chat_id and user_id and user_id != DAEMON_USER_ID:
-            try:
-                await send_message(DAEMON_USER_ID,
-                    f"Message from {display_name}\nID: {user_id}\n\n\"{text}\""
-                )
-            except Exception as e:
-                print(f"Error forwarding: {e}")
+            user_display_names[user_id] = display_name
 
             alert = check_for_keywords(text, display_name, user_id)
             if alert:
                 try:
                     paused_users.add(user_id)
-                    await send_message(DAEMON_USER_ID, alert)
                     await send_message(DAEMON_USER_ID,
-                        f"Bot auto-paused for {display_name} (ID: {user_id}).\n"
-                        f"Message them directly from your personal Telegram.\n"
-                        f"Send /resume {user_id} to hand back to the bot."
+                        f"🔔 LEAD ALERT\n\n"
+                        f"{alert}\n\n"
+                        f"Bot auto-paused.\n"
+                        f"Send /log {user_id} to read full chat\n"
+                        f"Send /takeover {user_id} confirmed (already paused)\n"
+                        f"Send /resume {user_id} to hand back to bot"
                     )
                 except Exception as e:
                     print(f"Error sending alert: {e}")
@@ -305,9 +377,6 @@ async def process_updates(offset=0):
                 try:
                     reply = await get_ai_reply(user_id, text)
                     await send_message(chat_id, reply)
-                    await send_message(DAEMON_USER_ID,
-                        f"Bot replied to {display_name}:\n\n\"{reply}\""
-                    )
                 except Exception as e:
                     print(f"Error handling message: {e}")
     return offset
