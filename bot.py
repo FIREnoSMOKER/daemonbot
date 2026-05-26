@@ -1,11 +1,46 @@
 import os
 import asyncio
 import httpx
+import json
+import redis
 
 BOT_TOKEN = os.environ.get("DAEMON_BOT_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 DAEMON_USER_ID = 786893182
+REDIS_URL = os.environ.get("REDIS_URL")
+
+# Connect to Redis
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+
+def get_history(user_id):
+    data = redis_client.get(f"history:{user_id}")
+    return json.loads(data) if data else []
+
+def save_history(user_id, history):
+    redis_client.set(f"history:{user_id}", json.dumps(history))
+
+def get_display_name(user_id):
+    return redis_client.get(f"name:{user_id}") or f"User {user_id}"
+
+def save_display_name(user_id, name):
+    redis_client.set(f"name:{user_id}", name)
+
+def get_all_user_ids():
+    keys = redis_client.keys("history:*")
+    return [int(k.split(":")[1]) for k in keys]
+
+def is_paused(user_id):
+    return redis_client.sismember("paused_users", user_id)
+
+def pause_user(user_id):
+    redis_client.sadd("paused_users", user_id)
+
+def resume_user(user_id):
+    redis_client.srem("paused_users", user_id)
+
+def get_paused_users():
+    return [int(uid) for uid in redis_client.smembers("paused_users")]
 
 ALERT_KEYWORDS = [
     "personal training", "1 to 1", "1-to-1",
@@ -158,9 +193,6 @@ SYSTEM_PROMPT = (
     "12. Never call anyone 'customer'"
 )
 
-user_histories = {}
-paused_users = set()
-
 def check_for_keywords(message, user_name, user_id):
     import re
     message_lower = message.lower()
@@ -195,10 +227,9 @@ async def send_message(chat_id, text):
         )
 
 async def get_ai_reply(user_id, user_message):
-    if user_id not in user_histories:
-        user_histories[user_id] = []
-    user_histories[user_id].append({"role": "user", "content": user_message})
-    history = user_histories[user_id][-30:]
+    history = get_history(user_id)
+    history.append({"role": "user", "content": user_message})
+    history = history[-30:]
     async with httpx.AsyncClient(timeout=60) as client:
         response = await client.post(
             "https://api.anthropic.com/v1/messages",
@@ -223,10 +254,11 @@ async def get_ai_reply(user_id, user_message):
         else:
             print(f"Unexpected response: {data}")
             reply = "Sorry, having a bit of trouble right now. Please try again in a moment!"
-    user_histories[user_id].append({"role": "assistant", "content": reply})
+    history.append({"role": "assistant", "content": reply})
+    save_history(user_id, history)
     return reply
 
-user_display_names = {}  # Store display names for each user ID
+user_display_names = {}  # Keep in memory for current session, Redis as backup
 
 async def handle_daemon_commands(text, chat_id):
     text = text.strip()
@@ -244,12 +276,14 @@ async def handle_daemon_commands(text, chat_id):
         return True
 
     if text == "/active":
-        if user_histories:
+        user_ids = get_all_user_ids()
+        if user_ids:
             lines = []
-            for uid, history in user_histories.items():
-                name = user_display_names.get(uid, f"ID: {uid}")
+            for uid in user_ids:
+                name = get_display_name(uid)
+                history = get_history(uid)
                 msg_count = len(history)
-                status = "PAUSED" if uid in paused_users else "active"
+                status = "PAUSED" if is_paused(uid) else "active"
                 last_msg = history[-1]["content"][:40] + "..." if history else ""
                 lines.append(f"{name}\nID: {uid} | {msg_count} messages | {status}\nLast: \"{last_msg}\"\n")
             await send_message(chat_id, "ACTIVE CONVERSATIONS\n\n" + "\n".join(lines))
@@ -261,16 +295,14 @@ async def handle_daemon_commands(text, chat_id):
         parts = text.split()
         if len(parts) == 2 and parts[1].isdigit():
             target_id = int(parts[1])
-            if target_id in user_histories and user_histories[target_id]:
-                name = user_display_names.get(target_id, f"User {target_id}")
-                history = user_histories[target_id]
+            history = get_history(target_id)
+            if history:
+                name = get_display_name(target_id)
                 lines = [f"CHAT LOG — {name}\n"]
                 for entry in history:
                     role = "Bot" if entry["role"] == "assistant" else name.split(" ")[0]
-                    content = entry["content"]
-                    lines.append(f"{role}: {content}\n")
+                    lines.append(f"{role}: {entry['content']}\n")
                 full_log = "\n".join(lines)
-                # Split into chunks if too long
                 if len(full_log) > 4000:
                     chunks = [full_log[i:i+4000] for i in range(0, len(full_log), 4000)]
                     for chunk in chunks:
@@ -287,8 +319,8 @@ async def handle_daemon_commands(text, chat_id):
         parts = text.split()
         if len(parts) == 2 and parts[1].isdigit():
             target_id = int(parts[1])
-            paused_users.add(target_id)
-            name = user_display_names.get(target_id, f"User {target_id}")
+            pause_user(target_id)
+            name = get_display_name(target_id)
             await send_message(chat_id,
                 f"Takeover activated for {name}.\n"
                 f"Bot is now silent for them.\n"
@@ -303,18 +335,19 @@ async def handle_daemon_commands(text, chat_id):
         parts = text.split()
         if len(parts) == 2 and parts[1].isdigit():
             target_id = int(parts[1])
-            paused_users.discard(target_id)
-            name = user_display_names.get(target_id, f"User {target_id}")
+            resume_user(target_id)
+            name = get_display_name(target_id)
             await send_message(chat_id, f"Bot resumed for {name}. Auto-reply is active again.")
         else:
             await send_message(chat_id, "Usage: /resume [Telegram ID]\nExample: /resume 987654321")
         return True
 
     if text == "/paused":
-        if paused_users:
+        paused = get_paused_users()
+        if paused:
             lines = []
-            for uid in paused_users:
-                name = user_display_names.get(uid, f"ID: {uid}")
+            for uid in paused:
+                name = get_display_name(uid)
                 lines.append(f"{name} — ID: {uid}")
             await send_message(chat_id, "PAUSED CONVERSATIONS\n\n" + "\n".join(lines))
         else:
@@ -349,31 +382,30 @@ async def process_updates(offset=0):
 
         has_media = any(k in message for k in ["video", "photo", "voice", "document", "animation", "sticker"])
         if has_media and chat_id and user_id != DAEMON_USER_ID:
-            if user_id not in paused_users:
+            if not is_paused(user_id):
                 await send_message(chat_id,
                     "Hey! I am not able to view videos, photos, or files through here unfortunately. "
                     "Feel free to send it over to my Instagram at daemon.caliversity and I will take a look at it there!"
                 )
 
         if text and chat_id and user_id and user_id != DAEMON_USER_ID:
-            user_display_names[user_id] = display_name
+            save_display_name(user_id, display_name)
 
             alert = check_for_keywords(text, display_name, user_id)
             if alert:
                 try:
-                    paused_users.add(user_id)
+                    pause_user(user_id)
                     await send_message(DAEMON_USER_ID,
-                        f"🔔 LEAD ALERT\n\n"
+                        f"LEAD ALERT\n\n"
                         f"{alert}\n\n"
                         f"Bot auto-paused.\n"
                         f"Send /log {user_id} to read full chat\n"
-                        f"Send /takeover {user_id} confirmed (already paused)\n"
                         f"Send /resume {user_id} to hand back to bot"
                     )
                 except Exception as e:
                     print(f"Error sending alert: {e}")
 
-            if user_id not in paused_users:
+            if not is_paused(user_id):
                 try:
                     reply = await get_ai_reply(user_id, text)
                     await send_message(chat_id, reply)
