@@ -86,7 +86,7 @@ async def get_ai_reply(user_id: int, user_message: str) -> str:
                 "content-type": "application/json"
             },
             json={
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-5",
                 "max_tokens": 1024,
                 "system": SYSTEM_PROMPT,
                 "messages": history
