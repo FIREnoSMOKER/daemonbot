@@ -1,1 +1,1 @@
-worker: python daemon_bot.py
+worker: python bot.py
